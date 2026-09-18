@@ -1,0 +1,9 @@
+huggingface_hub>=0.24
+requests
+boto3
+opensearch-py>=2.4.0
+numpy
+pyyaml
+tqdm
+openai
+nvtx
