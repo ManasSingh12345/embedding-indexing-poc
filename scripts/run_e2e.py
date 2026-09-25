@@ -38,6 +38,18 @@ os.environ.setdefault("CUPY_CACHE_DIR", str(ROOT / ".cache" / "cupy"))
 os.environ.setdefault("CUDA_CACHE_PATH", str(ROOT / ".cache" / "nv"))
 
 
+def gpu_product_name() -> str:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+            timeout=10,
+        )
+        return next((ln.strip() for ln in out.splitlines() if ln.strip()), "unknown")
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     norms = np.linalg.norm(x, axis=1, keepdims=True)
     return (x / np.maximum(norms, eps)).astype(np.float32, copy=False)
@@ -663,7 +675,7 @@ def main() -> int:
     usd = (wall_s / 3600.0) * args.gpu_usd_per_hour
     results = {
         "ts_utc": datetime.now(timezone.utc).isoformat(),
-        "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "hardware": gpu_product_name(),
         "gpu_sharing": "sequential embed-then-index, both containers on GPU 0, no Run:ai",
         "model": model,
         "index": index_name,

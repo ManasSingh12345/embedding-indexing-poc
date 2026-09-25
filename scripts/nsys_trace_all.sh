@@ -16,10 +16,18 @@ if [[ -f "${ROOT}/.env" ]]; then
 fi
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy || true
 
-NSYS="${NSYS:-${ROOT}/vendor/nsight-systems/target-linux-x64/nsys}"
-if [[ ! -x "${NSYS}" ]]; then
-  echo "nsys not found at ${NSYS}" >&2
-  exit 1
+NSYS="${NSYS:-}"
+if [[ -z "${NSYS}" ]]; then
+  if [[ -x "${ROOT}/vendor/nsight-systems/target-linux-x64/nsys" ]]; then
+    NSYS="${ROOT}/vendor/nsight-systems/target-linux-x64/nsys"
+  elif [[ -x "${ROOT}/vendor/nsight-systems/host-linux-x64/nsys" ]]; then
+    NSYS="${ROOT}/vendor/nsight-systems/host-linux-x64/nsys"
+  elif command -v nsys >/dev/null 2>&1; then
+    NSYS="$(command -v nsys)"
+  else
+    echo "nsys not found. Install the CLI under vendor/nsight-systems or set NSYS=." >&2
+    exit 1
+  fi
 fi
 
 if pgrep -f "${ROOT}/scripts/run_e2e.py" >/dev/null 2>&1; then
@@ -102,7 +110,7 @@ if "${NSYS}" profile \
   GPU_METRICS="--gpu-metrics-devices=all"
   echo "GPU metrics: on"
 else
-  echo "WARN: GPU performance counters denied (ERR_NVGPUCTRPERM on this Blackwell)." >&2
+  echo "WARN: GPU performance counters denied (ERR_NVGPUCTRPERM)." >&2
   echo "      Continuing without --gpu-metrics-devices. NVTX/CUDA still collected." >&2
   echo "      To enable metrics later (needs reboot/reload):" >&2
   echo "        sudo nvidia-smi -pm 1" >&2
@@ -136,7 +144,7 @@ ls -lh "${OUT_DIR}/e2e".* "${OUT_DIR}/metrics.json" 2>/dev/null || true
   | tee "${OUT_DIR}/e2e_stats.txt" \
   || true
 echo "Open ${OUT_DIR}/e2e.nsys-rep in Nsight Systems."
-echo "NVTX ranges: embed_batch / index_batch / cuVS / search."
+echo "NVTX ranges: load_docs, opensearch_recreate, embed_batch, index_bulk, index_flush, cuvs_bruteforce_topk10, opensearch_search."
 if [[ -z "${GPU_METRICS}" ]]; then
   echo "GPU SM-counter metrics were skipped (ERR_NVGPUCTRPERM). Kernel names from this process are still in cuda_gpu_kern_sum (cuVS only)."
 fi

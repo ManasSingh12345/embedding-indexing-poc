@@ -1,6 +1,6 @@
 # Embedding & indexing PoC (Milestone 1)
 
-Sequential **embed → GPU CAGRA/HNSW index → search** on **one** NVIDIA RTX PRO 6000. Measures e2e throughput, latency, and **Recall@10 vs cuVS brute-force** (not MIRACL qrels).
+Sequential **embed → GPU CAGRA/HNSW index → search** on **one** GPU (measured on an H100 NVL). Measures e2e throughput, latency, and **Recall@10 vs cuVS brute-force** (not MIRACL qrels).
 
 ```
 MIRACL texts → NIM (GPU 0) → OpenSearch bulk
@@ -8,7 +8,7 @@ MIRACL texts → NIM (GPU 0) → OpenSearch bulk
                  → cuVS GT top-10 → OpenSearch kNN → metrics.json
 ```
 
-NIM and the builder **share GPU 0**. Each microbatch embeds, then bulks. The remote CAGRA build runs once, after the last bulk. OpenSearch JVM stays on CPU. Run:ai 10:1 sharing is out of scope for this baseline.
+NIM and the builder **share GPU 0**. Each microbatch embeds, then bulks. The remote CAGRA build runs after the last bulk, one graph per Lucene segment. OpenSearch JVM stays on CPU. Run:ai 10:1 sharing is out of scope for this baseline.
 
 ## Not in this repo
 
@@ -73,7 +73,7 @@ Unset `HTTP_PROXY` / `HTTPS_PROXY` before `run_e2e.sh`. A sandbox proxy breaks l
 |---|---|
 | `embed_s` | NIM `/v1/embeddings` (`input_type=passage`), L2 normalize, memmap write |
 | `bulk_s` | Client NDJSON plus OpenSearch `_bulk` ingest. The graph is not built here. |
-| `flush_s` | `_flush` (segment commit, S3 upload, remote CAGRA → HNSW, `.faiss` download) and `_refresh` |
+| `flush_s` | `_flush` (segment commit, S3 upload, remote CAGRA → HNSW, `.faiss` download) and `_refresh`. One call still builds one graph per Lucene segment, serially. |
 
 `index_s` is `bulk_s + flush_s`.
 
@@ -86,7 +86,7 @@ Set in `.env.example` and applied by the scripts:
 | `NIM_PERFORMANCE_MODE` | `1` | NIM 2.3 throughput defaults, including pipeline batch 64. Latency mode left a 20k embed near 326 inputs/s; throughput mode reached about 709 inputs/s on an H100 NVL and used ~39 GiB instead of ~6 GiB. |
 | `REMOTE_BUILD_POLL_INTERVAL` | `200ms` | OpenSearch waits `3 × poll.interval` before the first status check. The 5s default is about 15s of idle time per flush. |
 | `--flush-every` | `0` | One remote build after all bulks. Flushing every 10k docs repeated that wait. |
-| `--bulk-docs` / `--bulk-workers` | `1000` / `4` | Larger `orjson` NDJSON batches and parallel `_bulk` POSTs. 20k bulk fell from ~20s to ~5s. |
+| `--bulk-docs` / `--bulk-workers` | `1000` / `4` | Larger `orjson` NDJSON batches and parallel `_bulk` POSTs. 20k bulk fell from ~20s to ~5s. Four index threads commit up to four Lucene segments (`refresh_interval=-1` does not merge them). A 20k flush built three graphs (6,574 / 8,103 / 5,323 docs) one after another. |
 | `--flush-parallel` / `MAX_WORKERS` | `1` / `1` | One index, one CAGRA job. Four concurrent builds on the same GPU stretched each ~1s graph to ~26s. |
 
 Published H100 FP16 passage throughput (batch 64, concurrency 1, 300 tokens) is 880 inputs/s. This client's MIRACL passages are ~125 tokens and the embed timer includes HTTP and the memmap write, so 709 inputs/s is still short of that table.
@@ -103,14 +103,18 @@ If `AWS_ENDPOINT_URL` or `S3_ENDPOINT` is set, `start_stack.sh` starts LocalStac
 
 ## Nsight Systems
 
-Do **not** wrap the NIM container with `nsys` as PID 1 (GPU goes idle). Profile the Python client; GPU *metrics* need `NVreg_RestrictProfilingToAdminUsers=0` on this Blackwell (otherwise `ERR_NVGPUCTRPERM`).
+Do **not** wrap NIM or the builder with `nsys` as container PID 1. Profile the Python client. GPU performance counters need `NVreg_RestrictProfilingToAdminUsers=0` (otherwise `ERR_NVGPUCTRPERM` on this host). The script uses `vendor/nsight-systems` when present, otherwise `nsys` on `PATH` (`/usr/local/bin/nsys` here).
 
 ```bash
-# After NIM is healthy (~16 GiB). Skips GPU counters if denied.
+# After NIM is healthy. Skips GPU counters if denied.
 ./scripts/nsys_trace_all.sh
 ```
 
-NVTX ranges: `embed_batch`, `index_batch`, `cuvs_bruteforce_topk10`, `opensearch_search`. Report: `results/nsys_all/e2e.nsys-rep`. That file has **cuVS kernels + client NVTX**, not NIM kernel names.
+Client NVTX ranges: `load_docs`, `opensearch_recreate`, `embed_batch`, `index_bulk`, `index_flush`, `cuvs_bruteforce_topk10`, `opensearch_search`. Report: `results/nsys_all/e2e.nsys-rep`. That file has **client NVTX and host cuVS kernels**. NIM and the builder are other containers, so their CUDA is not in it. System-wide CUDA injection does not cross into Docker here.
+
+A builder capture has to start nsys inside the container (`docker run --init`) and stop it with `docker exec -u appuser nsys stop --session=...` (uid 1001; a host `kill` is EPERM). Open that `.nsys-rep` next to the client report in the Nsight GUI. There is no CLI merge. NIM export crashes in `TimeConversion.cpp` during GPU tick conversion, so there is no NIM kernel report.
+
+On a 20k run the builder timeline is three bursts about 3s apart: one CAGRA build per Lucene segment, serial because `MAX_WORKERS=1`. Each burst is mostly k-means. The only NVTX ranges are CUB (`cub::DeviceHistogram::MultiHistogramEven`, `cub::DeviceFor::Bulk`). The graph itself is a short unannotated tail: two `compute_similarity` GEMMs, `kern_prune`, `kern_make_rev_graph`. About 166k `cudaFree`/`cudaMalloc` pairs are temporary-buffer churn (~7 per k-means step, median ~3µs), not HBM traffic. Kernel GPU time was 1.06s across 268k kernels (average 4µs); memcpy was about 4 GB/s. That loop is launch-and-allocation bound. The six long similarity GEMMs (0.24s) are the only kernels that might be compute- or bandwidth-bound, and this capture has no DRAM counters.
 
 ## Agent notes
 

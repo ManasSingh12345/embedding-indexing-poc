@@ -8,10 +8,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-NSYS="${NSYS:-${ROOT}/vendor/nsight-systems/target-linux-x64/nsys}"
-if [[ ! -x "${NSYS}" ]]; then
-  echo "nsys not found at ${NSYS}" >&2
-  exit 1
+NSYS="${NSYS:-}"
+if [[ -z "${NSYS}" ]]; then
+  if [[ -x "${ROOT}/vendor/nsight-systems/target-linux-x64/nsys" ]]; then
+    NSYS="${ROOT}/vendor/nsight-systems/target-linux-x64/nsys"
+  elif command -v nsys >/dev/null 2>&1; then
+    NSYS="$(command -v nsys)"
+  else
+    echo "nsys not found. Install the CLI under vendor/nsight-systems or set NSYS=." >&2
+    exit 1
+  fi
 fi
 
 DURATION="${DURATION:-90}"
