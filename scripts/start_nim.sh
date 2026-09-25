@@ -27,12 +27,12 @@ fi
 GPU_ID="${NVIDIA_VISIBLE_DEVICES:-0}"
 
 docker run -d --name="${CONTAINER_NAME}" \
-  --runtime=nvidia \
   --gpus "device=${GPU_ID}" \
   --shm-size=16GB \
   -e NVIDIA_VISIBLE_DEVICES="${GPU_ID}" \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
   -e NIM_ENGINE_MODEL_DOWNLOAD_PROVIDER=ngc \
+  -e NIM_PERFORMANCE_MODE="${NIM_PERFORMANCE_MODE:-1}" \
   -e NGC_API_KEY \
   -v "${LOCAL_NIM_CACHE}/cache:/opt/cache" \
   -v "${LOCAL_NIM_CACHE}/weights:/model" \

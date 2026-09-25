@@ -17,6 +17,12 @@ export AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION}}"
 export REMOTE_INDEX_BUILDER_IMAGE="${REMOTE_INDEX_BUILDER_IMAGE:-opensearchproject/remote-vector-index-builder:api-latest}"
 export MAX_WORKERS="${MAX_WORKERS:-1}"
 export COMPOSE_PROFILES="${COMPOSE_PROFILES:-gpu}"
+if [[ -n "${S3_ENDPOINT:-}" || -n "${AWS_ENDPOINT_URL:-}" ]]; then
+  case ",${COMPOSE_PROFILES}," in
+    *,local-s3,*) ;;
+    *) export COMPOSE_PROFILES="${COMPOSE_PROFILES},local-s3" ;;
+  esac
+fi
 
 if [[ -n "${NGC_API_KEY:-}" ]]; then
   echo "$NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin || true
@@ -36,7 +42,41 @@ if ! docker compose version >/dev/null 2>&1; then
   fi
 fi
 
-"${COMPOSE[@]}" --profile gpu up --build -d --wait opensearch remote-index-builder
+UP_SERVICES=(opensearch remote-index-builder)
+if [[ ",${COMPOSE_PROFILES}," == *",local-s3,"* ]]; then
+  UP_SERVICES+=(localstack)
+fi
+"${COMPOSE[@]}" --profile gpu --profile local-s3 up --build -d --wait "${UP_SERVICES[@]}"
+
+if [[ -n "${S3_BUCKET:-}" && -n "${S3_ENDPOINT:-}${AWS_ENDPOINT_URL:-}" ]]; then
+  echo "==> Ensuring S3 bucket ${S3_BUCKET} exists"
+  "${ROOT}/.venv/bin/python" - <<'PY'
+import os
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+endpoint = (os.environ.get("AWS_ENDPOINT_URL") or os.environ.get("S3_ENDPOINT") or "").strip()
+# Host-side client cannot resolve compose DNS names.
+endpoint = endpoint.replace("http://minio:", "http://127.0.0.1:").replace("https://minio:", "https://127.0.0.1:")
+endpoint = endpoint.replace("http://localstack:", "http://127.0.0.1:").replace("https://localstack:", "https://127.0.0.1:")
+bucket = os.environ["S3_BUCKET"]
+region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+kwargs = {"region_name": region, "config": Config(s3={"addressing_style": "path"})}
+if endpoint:
+    kwargs["endpoint_url"] = endpoint
+s3 = boto3.client("s3", **kwargs)
+try:
+    s3.head_bucket(Bucket=bucket)
+    print(f"bucket exists: {bucket}")
+except ClientError:
+    create = {"Bucket": bucket}
+    if region and region != "us-east-1":
+        create["CreateBucketConfiguration"] = {"LocationConstraint": region}
+    s3.create_bucket(**create)
+    print(f"created bucket: {bucket}")
+PY
+fi
 
 OPENSEARCH_URL="${OPENSEARCH_URL:-http://127.0.0.1:9200}"
 REMOTE_INDEX_BUILDER_URL="${REMOTE_INDEX_BUILDER_URL:-http://127.0.0.1:1025}"

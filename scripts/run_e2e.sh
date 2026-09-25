@@ -28,7 +28,7 @@ echo
 python3 -c 'import socket; socket.create_connection(("127.0.0.1",1025),3).close(); print("builder ok")'
 
 echo "==> Installing cuVS + CuPy if needed"
-"${PIP}" install --extra-index-url https://pypi.nvidia.com 'cuvs-cu13==26.8.1' 'cupy-cuda13x'
+"${PIP}" install --extra-index-url https://pypi.nvidia.com 'cuvs-cu13==26.8.1' 'cupy-cuda13x' orjson
 
 echo "==> GPU"
 nvidia-smi -L

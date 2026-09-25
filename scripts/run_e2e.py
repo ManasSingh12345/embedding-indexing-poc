@@ -6,17 +6,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import random
 import statistics
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import orjson
 import requests
 from tqdm import tqdm
 
@@ -149,19 +152,56 @@ class OpenSearchKnn:
         self.url = url.rstrip("/")
         self.index = index
         self.dim = dim
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
+        self.n_parts = 1
+        self.part_names = [index]
+        self._tls = threading.local()
+        self._writer_queues: list[queue.Queue] = []
+        self._writer_threads: list[threading.Thread] = []
+        self._writer_cv = threading.Condition()
+        self._writer_inflight = 0
+        self._writer_error: BaseException | None = None
+
+    def _http(self) -> requests.Session:
+        sess = getattr(self._tls, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            sess.headers.update({"Content-Type": "application/json"})
+            self._tls.session = sess
+        return sess
 
     def _req(self, method: str, path: str, **kwargs: Any) -> requests.Response:
-        resp = self.session.request(method, f"{self.url}{path}", timeout=kwargs.pop("timeout", 120), **kwargs)
+        resp = self._http().request(method, f"{self.url}{path}", timeout=kwargs.pop("timeout", 120), **kwargs)
         if resp.status_code >= 400:
             raise RuntimeError(f"OpenSearch {method} {path} {resp.status_code}: {resp.text[:800]}")
         return resp
 
-    def recreate(self) -> None:
-        exists = self.session.head(f"{self.url}/{self.index}", timeout=30)
-        if exists.status_code == 200:
-            self._req("DELETE", f"/{self.index}")
+    def recreate(self, n_parts: int = 1) -> None:
+        self._stop_writers()
+        self.n_parts = max(1, n_parts)
+        self.part_names = (
+            [self.index] if self.n_parts == 1 else [f"{self.index}-{i}" for i in range(self.n_parts)]
+        )
+        self._delete_existing()
+        for name in self.part_names:
+            self._create_index(name)
+        if self.n_parts > 1:
+            # One index per flush thread. A single-index _flush walks shards serially.
+            actions = [{"add": {"index": name, "alias": self.index}} for name in self.part_names]
+            self._req("POST", "/_aliases", json={"actions": actions})
+            self._start_writers()
+
+    def _delete_existing(self) -> None:
+        resp = self._http().get(
+            f"{self.url}/_cat/indices/{self.index}*?h=index&format=json",
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            for row in resp.json():
+                self._req("DELETE", f"/{row['index']}")
+        elif resp.status_code != 404:
+            raise RuntimeError(f"list indices {resp.status_code}: {resp.text[:400]}")
+
+    def _create_index(self, name: str) -> None:
         body = {
             "settings": {
                 "index.knn": True,
@@ -190,44 +230,167 @@ class OpenSearchKnn:
                 }
             },
         }
-        self._req("PUT", f"/{self.index}", json=body)
+        self._req("PUT", f"/{name}", json=body)
 
-    def bulk_vectors(self, rows: np.ndarray, vectors: np.ndarray, docids: list[str], bulk_docs: int) -> None:
-        for start in range(0, len(rows), bulk_docs):
-            sl = slice(start, start + bulk_docs)
-            lines: list[str] = []
-            for row, vec, docid in zip(rows[sl], vectors[sl], docids[sl], strict=True):
-                lines.append(json.dumps({"index": {"_index": self.index, "_id": str(int(row))}}))
-                lines.append(
-                    json.dumps(
-                        {
-                            "vector": vec.tolist(),
-                            "docid": docid,
-                            "row": int(row),
-                        }
-                    )
-                )
-            payload = ("\n".join(lines) + "\n").encode("utf-8")
-            resp = self.session.post(
-                f"{self.url}/_bulk",
-                data=payload,
-                headers={"Content-Type": "application/x-ndjson"},
-                timeout=300,
+    def _encode_bulk_chunk(
+        self, index: str, rows: np.ndarray, vectors: np.ndarray, docids: list[str]
+    ) -> bytes:
+        parts: list[bytes] = []
+        dumps = orjson.dumps
+        opt = orjson.OPT_SERIALIZE_NUMPY
+        for row, vec, docid in zip(rows, vectors, docids, strict=True):
+            parts.append(dumps({"index": {"_index": index, "_id": str(int(row))}}))
+            parts.append(dumps({"vector": vec, "docid": docid, "row": int(row)}, option=opt))
+        return b"\n".join(parts) + b"\n"
+
+    def _post_bulk(self, payload: bytes) -> None:
+        resp = self._http().post(
+            f"{self.url}/_bulk",
+            data=payload,
+            headers={"Content-Type": "application/x-ndjson"},
+            timeout=300,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"bulk {resp.status_code}: {resp.text[:500]}")
+        body = resp.json()
+        if body.get("errors"):
+            err = next(
+                item["index"]["error"]
+                for item in body["items"]
+                if "error" in item.get("index", {})
             )
-            if resp.status_code >= 400:
-                raise RuntimeError(f"bulk {resp.status_code}: {resp.text[:500]}")
-            body = resp.json()
-            if body.get("errors"):
-                err = next(
-                    item["index"]["error"]
-                    for item in body["items"]
-                    if "error" in item.get("index", {})
-                )
-                raise RuntimeError(f"bulk item error: {err}")
+            raise RuntimeError(f"bulk item error: {err}")
+
+    def _bulk_slice(self, index: str, rows: np.ndarray, vectors: np.ndarray, docids: list[str]) -> None:
+        self._post_bulk(self._encode_bulk_chunk(index, rows, vectors, docids))
+
+    def _bulk_rows(
+        self,
+        index: str,
+        rows: np.ndarray,
+        vectors: np.ndarray,
+        docids: list[str],
+        bulk_docs: int,
+        bulk_workers: int,
+    ) -> None:
+        n = len(rows)
+        slices = [slice(start, min(start + bulk_docs, n)) for start in range(0, n, bulk_docs)]
+        workers = max(1, min(bulk_workers, len(slices)))
+        if workers == 1:
+            for sl in slices:
+                self._bulk_slice(index, rows[sl], vectors[sl], docids[sl])
+            return
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [
+                pool.submit(self._bulk_slice, index, rows[sl], vectors[sl], docids[sl])
+                for sl in slices
+            ]
+            for fut in as_completed(futs):
+                fut.result()
+
+    def _start_writers(self) -> None:
+        self._writer_queues = [queue.Queue() for _ in range(self.n_parts)]
+        self._writer_threads = []
+        for part in range(self.n_parts):
+            thread = threading.Thread(
+                target=self._writer_loop,
+                args=(part,),
+                name=f"bulk-part-{part}",
+                daemon=True,
+            )
+            thread.start()
+            self._writer_threads.append(thread)
+
+    def _stop_writers(self) -> None:
+        for writer_q in self._writer_queues:
+            writer_q.put(None)
+        for thread in self._writer_threads:
+            thread.join(timeout=30)
+        self._writer_queues = []
+        self._writer_threads = []
+
+    def _writer_loop(self, part: int) -> None:
+        writer_q = self._writer_queues[part]
+        index = self.part_names[part]
+        while True:
+            item = writer_q.get()
+            if item is None:
+                return
+            rows, vectors, docids, bulk_docs = item
+            try:
+                # One thread per index keeps a single Lucene segment, so each
+                # concurrent flush submits exactly one remote build.
+                self._bulk_rows(index, rows, vectors, docids, bulk_docs, bulk_workers=1)
+            except Exception as exc:
+                with self._writer_cv:
+                    if self._writer_error is None:
+                        self._writer_error = exc
+                    self._writer_inflight -= 1
+                    if self._writer_inflight == 0:
+                        self._writer_cv.notify_all()
+            else:
+                with self._writer_cv:
+                    self._writer_inflight -= 1
+                    if self._writer_inflight == 0:
+                        self._writer_cv.notify_all()
+
+    def _bulk_partitioned(
+        self,
+        rows: np.ndarray,
+        vectors: np.ndarray,
+        docids: list[str],
+        bulk_docs: int,
+    ) -> None:
+        buckets: list[list[int]] = [[] for _ in range(self.n_parts)]
+        for i in range(len(rows)):
+            buckets[int(rows[i]) % self.n_parts].append(i)
+        jobs: list[tuple[int, np.ndarray, np.ndarray, list[str]]] = []
+        for part, idxs in enumerate(buckets):
+            if not idxs:
+                continue
+            sel = np.asarray(idxs, dtype=np.int64)
+            jobs.append((part, rows[sel], vectors[sel], [docids[j] for j in idxs]))
+        with self._writer_cv:
+            if self._writer_error is not None:
+                err = self._writer_error
+                self._writer_error = None
+                raise err
+            self._writer_inflight = len(jobs)
+        for part, part_rows, part_vecs, part_ids in jobs:
+            self._writer_queues[part].put((part_rows, part_vecs, part_ids, bulk_docs))
+        with self._writer_cv:
+            while self._writer_inflight:
+                self._writer_cv.wait()
+            if self._writer_error is not None:
+                err = self._writer_error
+                self._writer_error = None
+                raise err
+
+    def bulk_vectors(
+        self,
+        rows: np.ndarray,
+        vectors: np.ndarray,
+        docids: list[str],
+        bulk_docs: int,
+        bulk_workers: int = 1,
+    ) -> None:
+        if self.n_parts > 1:
+            self._bulk_partitioned(rows, vectors, docids, bulk_docs)
+            return
+        self._bulk_rows(self.index, rows, vectors, docids, bulk_docs, bulk_workers)
 
     def flush_and_refresh(self) -> None:
-        self._req("POST", f"/{self.index}/_flush", timeout=300)
-        self._req("POST", f"/{self.index}/_refresh", timeout=120)
+        def one(name: str) -> None:
+            self._req("POST", f"/{name}/_flush", timeout=300)
+            self._req("POST", f"/{name}/_refresh", timeout=120)
+
+        if len(self.part_names) == 1:
+            one(self.part_names[0])
+            return
+        with ThreadPoolExecutor(max_workers=len(self.part_names)) as pool:
+            futs = [pool.submit(one, name) for name in self.part_names]
+            for fut in as_completed(futs):
+                fut.result()
 
     def count(self) -> int:
         return int(self._req("GET", f"/{self.index}/_count").json()["count"])
@@ -336,12 +499,35 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=1_000_000)
     parser.add_argument("--microbatch", type=int, default=10_000)
     parser.add_argument("--nim-batch", type=int, default=64)
-    parser.add_argument("--bulk-docs", type=int, default=250)
+    parser.add_argument(
+        "--bulk-docs",
+        type=int,
+        default=int(os.environ.get("BULK_DOCS", "1000")),
+        help="Docs per OpenSearch _bulk request (default 1000).",
+    )
+    parser.add_argument(
+        "--bulk-workers",
+        type=int,
+        default=int(os.environ.get("BULK_WORKERS", "4")),
+        help="Parallel _bulk HTTP workers (default 4). 1 = serial.",
+    )
     parser.add_argument("--queries", type=int, default=5_000)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--dim", type=int, default=1024)
     parser.add_argument("--ef-search", type=int, default=256)
     parser.add_argument("--gpu-usd-per-hour", type=float, default=3.0)
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=0,
+        help="Flush+remote CAGRA every N docs. 0 = once after all bulks (default).",
+    )
+    parser.add_argument(
+        "--flush-parallel",
+        type=int,
+        default=int(os.environ.get("FLUSH_PARALLEL", "1")),
+        help="Indices flushed at once (default 1). Values above 1 submit that many remote builds together; on one GPU that made 20k CAGRA slower.",
+    )
     parser.add_argument(
         "--out-dir",
         type=Path,
@@ -376,18 +562,31 @@ def main() -> int:
     os_knn = OpenSearchKnn(os_url, index_name, args.dim)
     print("Creating OpenSearch index", flush=True)
     with nvtx.annotate("opensearch_recreate", color=0xFFD700):
-        os_knn.recreate()
+        os_knn.recreate(args.flush_parallel)
 
     gpu = GpuSampler(out_dir / "gpu_timeseries.csv")
     gpu.start()
 
     embed_s = 0.0
-    index_s = 0.0
+    bulk_s = 0.0
+    flush_s = 0.0
+    n_flushes = 0
     t0 = time.perf_counter()
     n_batches = (n + args.microbatch - 1) // args.microbatch
     faiss_before = s3_faiss_count(bucket, prefix, region)
 
+    def do_flush() -> None:
+        nonlocal flush_s, n_flushes
+        stats_before = os_knn.knn_stats()
+        tf0 = time.perf_counter()
+        with nvtx.annotate("index_flush", color=0x32CD32):
+            os_knn.flush_and_refresh()
+            wait_for_remote_build(os_knn, stats_before, timeout_s=180)
+        flush_s += time.perf_counter() - tf0
+        n_flushes += 1
+
     try:
+        indexed_since_flush = 0
         for b in tqdm(range(n_batches), desc="microbatches"):
             sl = slice(b * args.microbatch, min(n, (b + 1) * args.microbatch))
             batch_texts = texts[sl]
@@ -401,22 +600,32 @@ def main() -> int:
                 embeddings.flush()
             embed_s += time.perf_counter() - te0
 
-            ti0 = time.perf_counter()
-            with nvtx.annotate("index_batch", color=0x32CD32):
-                stats_before = os_knn.knn_stats()
-                os_knn.bulk_vectors(rows, vecs, batch_ids, args.bulk_docs)
-                os_knn.flush_and_refresh()
-                time.sleep(3)
-                wait_for_remote_build(os_knn, stats_before, timeout_s=180)
-            index_s += time.perf_counter() - ti0
+            tb0 = time.perf_counter()
+            with nvtx.annotate("index_bulk", color=0x228B22):
+                os_knn.bulk_vectors(
+                    rows, vecs, batch_ids, args.bulk_docs, bulk_workers=args.bulk_workers
+                )
+            bulk_s += time.perf_counter() - tb0
+            indexed_since_flush += len(batch_texts)
+            last = b + 1 == n_batches
+            if args.flush_every > 0 and indexed_since_flush >= args.flush_every and not last:
+                do_flush()
+                indexed_since_flush = 0
+        do_flush()
     finally:
         gpu_summary = gpu.stop()
 
     wall_s = time.perf_counter() - t0
+    index_s = bulk_s + flush_s
     count = os_knn.count()
     faiss_after = s3_faiss_count(bucket, prefix, region)
 
-    print(f"Indexed count={count} wall={wall_s:.1f}s embed={embed_s:.1f}s index={index_s:.1f}s", flush=True)
+    print(
+        f"Indexed count={count} wall={wall_s:.1f}s embed={embed_s:.1f}s "
+        f"index={index_s:.1f}s (bulk={bulk_s:.1f}s flush={flush_s:.1f}s n_flush={n_flushes} "
+        f"bulk_docs={args.bulk_docs} workers={args.bulk_workers} flush_parallel={args.flush_parallel})",
+        flush=True,
+    )
 
     rng = random.Random(42)
     qn = min(args.queries, n)
@@ -470,6 +679,13 @@ def main() -> int:
         "embed_index_wall_s": wall_s,
         "embed_s": embed_s,
         "index_s": index_s,
+        "bulk_s": bulk_s,
+        "flush_s": flush_s,
+        "n_flushes": n_flushes,
+        "flush_every": args.flush_every,
+        "bulk_docs": args.bulk_docs,
+        "bulk_workers": args.bulk_workers,
+        "flush_parallel": args.flush_parallel,
         "embed_index_ratio": (embed_s / index_s) if index_s else None,
         "vectors_per_s": n / wall_s if wall_s else None,
         "embed_vectors_per_s": n / embed_s if embed_s else None,

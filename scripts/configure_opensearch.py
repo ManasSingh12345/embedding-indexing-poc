@@ -33,16 +33,20 @@ def main() -> None:
         snapshot["settings"]["endpoint"] = endpoint
         snapshot["settings"]["path_style_access"] = True
         snapshot["settings"]["protocol"] = "http" if endpoint.startswith("http://") else "https"
+        snapshot["settings"]["disable_chunked_encoding"] = True
 
     resp = session.put(f"{opensearch_url}/_snapshot/{repository}", json=snapshot, timeout=60)
     print("snapshot repo:", resp.status_code, resp.text)
     resp.raise_for_status()
 
+    # Default 5s × INITIAL_DELAY_FACTOR=3 ≈ 15s idle per flush. 200ms → ~0.6s first poll.
+    poll_interval = os.environ.get("REMOTE_BUILD_POLL_INTERVAL", "200ms").strip() or "200ms"
     settings = {
         "persistent": {
             "knn.remote_index_build.enabled": True,
             "knn.remote_index_build.repository": repository,
             "knn.remote_index_build.service.endpoint": builder_url,
+            "knn.remote_index_build.poll.interval": poll_interval,
         }
     }
     resp = session.put(f"{opensearch_url}/_cluster/settings", json=settings, timeout=60)

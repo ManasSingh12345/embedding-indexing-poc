@@ -8,7 +8,7 @@ MIRACL texts → NIM (GPU 0) → OpenSearch bulk
                  → cuVS GT top-10 → OpenSearch kNN → metrics.json
 ```
 
-NIM and the builder **share GPU 0**. They run one after the other in each 10k microbatch. OpenSearch JVM stays on CPU. Run:ai 10:1 sharing is out of scope for this baseline.
+NIM and the builder **share GPU 0**. Each microbatch embeds, then bulks. The remote CAGRA build runs once, after the last bulk. OpenSearch JVM stays on CPU. Run:ai 10:1 sharing is out of scope for this baseline.
 
 ## Not in this repo
 
@@ -64,6 +64,42 @@ aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX:-knn-indexes}/" --recursive --region "$
 ```
 
 Write-up: `results/m1_sequential/metrics.json` (wall, embed vs index, vec/s, Recall@10, p50/p95, QPS). Target Recall@10 ≥ 0.95.
+
+Unset `HTTP_PROXY` / `HTTPS_PROXY` before `run_e2e.sh`. A sandbox proxy breaks localhost calls to NIM and OpenSearch.
+
+## Timers
+
+| Field | What it includes |
+|---|---|
+| `embed_s` | NIM `/v1/embeddings` (`input_type=passage`), L2 normalize, memmap write |
+| `bulk_s` | Client NDJSON plus OpenSearch `_bulk` ingest. The graph is not built here. |
+| `flush_s` | `_flush` (segment commit, S3 upload, remote CAGRA → HNSW, `.faiss` download) and `_refresh` |
+
+`index_s` is `bulk_s + flush_s`.
+
+## Defaults
+
+Set in `.env.example` and applied by the scripts:
+
+| Knob | Default | Why |
+|---|---|---|
+| `NIM_PERFORMANCE_MODE` | `1` | NIM 2.3 throughput defaults, including pipeline batch 64. Latency mode left a 20k embed near 326 inputs/s; throughput mode reached about 709 inputs/s on an H100 NVL and used ~39 GiB instead of ~6 GiB. |
+| `REMOTE_BUILD_POLL_INTERVAL` | `200ms` | OpenSearch waits `3 × poll.interval` before the first status check. The 5s default is about 15s of idle time per flush. |
+| `--flush-every` | `0` | One remote build after all bulks. Flushing every 10k docs repeated that wait. |
+| `--bulk-docs` / `--bulk-workers` | `1000` / `4` | Larger `orjson` NDJSON batches and parallel `_bulk` POSTs. 20k bulk fell from ~20s to ~5s. |
+| `--flush-parallel` / `MAX_WORKERS` | `1` / `1` | One index, one CAGRA job. Four concurrent builds on the same GPU stretched each ~1s graph to ~26s. |
+
+Published H100 FP16 passage throughput (batch 64, concurrency 1, 300 tokens) is 880 inputs/s. This client's MIRACL passages are ~125 tokens and the embed timer includes HTTP and the memmap write, so 709 inputs/s is still short of that table.
+
+## Recall
+
+Ground truth is **cuVS brute-force cosine top-10** over the same L2-normalized vectors that were indexed, not MIRACL qrels. The 5,000 queries are document rows drawn with seed 42. OpenSearch search is inner product, `ef_search=256`, `k=10`.
+
+Recall@10 matches cuVS [`calc_recall`](https://github.com/NVIDIA/cuvs/blob/main/notebooks/utils.py): for each query, `|set(pred[:k]) ∩ set(gt[:k])|`, divided by `n_queries * k`.
+
+## Local S3
+
+If `AWS_ENDPOINT_URL` or `S3_ENDPOINT` is set, `start_stack.sh` starts LocalStack and creates the bucket from the host (compose DNS names are rewritten to `127.0.0.1`). Leave those unset to use real AWS.
 
 ## Nsight Systems
 
