@@ -71,6 +71,8 @@ services:
       MAX_WORKERS: ${MAX_WORKERS:-1}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NVIDIA_GPU_MEMORY_REQUEST: ${INDEX_GPU_MEMORY_REQUEST_MIB:?set by scripts/start_stack.sh}
+      NVIDIA_GPU_MEMORY_LIMIT: ${INDEX_GPU_MEMORY_LIMIT_MIB:?set by scripts/start_stack.sh}
     ports:
       - "1025:1025"
     healthcheck:

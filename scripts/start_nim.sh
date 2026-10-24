@@ -16,6 +16,14 @@ export CONTAINER_NAME="${CONTAINER_NAME:-$(basename "${NIM_MODEL_NAME}")}"
 export IMG_NAME="${IMG_NAME:-nvcr.io/nim/nvidia/${CONTAINER_NAME}:2.3.0}"
 export LOCAL_NIM_CACHE="${LOCAL_NIM_CACHE:-${ROOT}/.cache/nim}"
 export NIM_PORT="${NIM_PORT:-8000}"
+export NIM_PERFORMANCE_MODE="${NIM_PERFORMANCE_MODE:-1}"
+
+PY="${ROOT}/.venv/bin/python"
+if [[ ! -x "${PY}" ]]; then
+  PY=python3
+fi
+# Memory caps from config/pipeline.yaml (Run:ai GPU fractioning env).
+eval "$("${PY}" "${ROOT}/scripts/pipeline_config.py" exports)"
 
 mkdir -p "${LOCAL_NIM_CACHE}/cache" "${LOCAL_NIM_CACHE}/weights"
 
@@ -23,7 +31,7 @@ if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
   docker rm -f "${CONTAINER_NAME}" >/dev/null
 fi
 
-# Same GPU as the CAGRA builder (sequential embed-then-index on one Pro 6000).
+# Same GPU as the CAGRA builder. Fractions come from config/pipeline.yaml.
 GPU_ID="${NVIDIA_VISIBLE_DEVICES:-0}"
 
 docker run -d --name="${CONTAINER_NAME}" \
@@ -31,8 +39,10 @@ docker run -d --name="${CONTAINER_NAME}" \
   --shm-size=16GB \
   -e NVIDIA_VISIBLE_DEVICES="${GPU_ID}" \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+  -e NVIDIA_GPU_MEMORY_REQUEST="${EMBED_GPU_MEMORY_REQUEST_MIB}" \
+  -e NVIDIA_GPU_MEMORY_LIMIT="${EMBED_GPU_MEMORY_LIMIT_MIB}" \
   -e NIM_ENGINE_MODEL_DOWNLOAD_PROVIDER=ngc \
-  -e NIM_PERFORMANCE_MODE="${NIM_PERFORMANCE_MODE:-1}" \
+  -e NIM_PERFORMANCE_MODE="${NIM_PERFORMANCE_MODE}" \
   -e NGC_API_KEY \
   -v "${LOCAL_NIM_CACHE}/cache:/opt/cache" \
   -v "${LOCAL_NIM_CACHE}/weights:/model" \

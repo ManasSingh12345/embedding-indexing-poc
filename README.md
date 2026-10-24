@@ -1,121 +1,156 @@
-# Embedding & indexing PoC (Milestone 1)
+# Embed and index on one GPU
 
-Sequential **embed → GPU CAGRA/HNSW index → search** on **one** GPU (measured on an H100 NVL). Measures e2e throughput, latency, and **Recall@10 vs cuVS brute-force** (not MIRACL qrels).
+Measure embed + CAGRA/HNSW index time, search p95, QPS, and Recall@10 for 1,000,000 MIRACL vectors on a single GPU. Embedding and indexing share that GPU through Run:ai's open-source [GPU Fractioning Operator](https://github.com/kai-scheduler/gpu-fractioning).
 
 ```
-MIRACL texts → NIM (GPU 0) → OpenSearch bulk
-                 flush → remote-index-builder CAGRA (same GPU)
+MIRACL texts → NIM (GPU fraction) → OpenSearch bulk
+                 each microbatch → remote builder CAGRA (other fraction)
                  → cuVS GT top-10 → OpenSearch kNN → metrics.json
 ```
 
-NIM and the builder **share GPU 0**. Each microbatch embeds, then bulks. The remote CAGRA build runs after the last bulk, one graph per Lucene segment. OpenSearch JVM stays on CPU. Run:ai 10:1 sharing is out of scope for this baseline.
+OpenSearch itself stays on CPU. The how-to notebook is [`notebooks/embed_index_runai.ipynb`](notebooks/embed_index_runai.ipynb).
 
-## Not in this repo
+## Configuration table
 
-| Keep local | Why |
-|---|---|
-| `.env` | NGC + AWS keys |
-| `data/` | MIRACL 1M |
-| `vendor/` | Nsight CLI, cloned cuVS / builder |
-| `results/` | embeddings, nsys reports |
-| `.venv/`, `.cache/` | Python + NIM weights |
+Edit [`config/pipeline.yaml`](config/pipeline.yaml), then restart the GPU containers. That file is the source of truth. Command-line flags override it for one run.
 
-Copy `.env.example` → `.env`. Never commit keys or corpus files.
-
-## Stack
-
-| Piece | What |
-|---|---|
-| NIM | `nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.3.0`, 1024-d FP32, L2-normalized |
-| OpenSearch | 3.6.0 + kNN + S3 repo; Faiss HNSW inner product |
-| Builder | `opensearchproject/remote-vector-index-builder` on GPU 0 (CAGRA → HNSW) |
-| GT / recall | cuVS 26.8 brute-force cosine top-10 |
-
-## Setup (GPU host shell)
-
-Cursor’s agent sandbox cannot see `/dev/nvidia*` or `:8000`. Use the instance SSH/host terminal.
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env   # set NGC_API_KEY, S3_BUCKET, AWS creds
-./scripts/bootstrap.sh
-./scripts/ensure_gpu.sh
-./scripts/check_setup.sh
-```
-
-`bootstrap.sh` pulls NIM, downloads MIRACL 1M, starts OpenSearch + builder + NIM.
-
-## Run
-
-```bash
-# Smoke (2 × 10k)
-./scripts/run_e2e.sh --limit 20000
-
-# Full 1M (recreates index miracl-en-1m-cagra)
-./scripts/run_e2e.sh
-```
-
-Each run **deletes and recreates** the OpenSearch index. Optional S3 staging cleanup:
-
-```bash
-set -a && source .env && set +a
-curl -X DELETE http://127.0.0.1:9200/miracl-en-1m-cagra
-aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX:-knn-indexes}/" --recursive --region "${AWS_DEFAULT_REGION:-us-east-2}"
-```
-
-Write-up: `results/m1_sequential/metrics.json` (wall, embed vs index, vec/s, Recall@10, p50/p95, QPS). Target Recall@10 ≥ 0.95.
-
-Unset `HTTP_PROXY` / `HTTPS_PROXY` before `run_e2e.sh`. A sandbox proxy breaks localhost calls to NIM and OpenSearch.
-
-## Timers
-
-| Field | What it includes |
-|---|---|
-| `embed_s` | NIM `/v1/embeddings` (`input_type=passage`), L2 normalize, memmap write |
-| `bulk_s` | Client NDJSON plus OpenSearch `_bulk` ingest. The graph is not built here. |
-| `flush_s` | `_flush` (segment commit, S3 upload, remote CAGRA → HNSW, `.faiss` download) and `_refresh`. One call still builds one graph per Lucene segment, serially. |
-
-`index_s` is `bulk_s + flush_s`.
-
-## Defaults
-
-Set in `.env.example` and applied by the scripts:
-
-| Knob | Default | Why |
+| Field | Default | Effect |
 |---|---|---|
-| `NIM_PERFORMANCE_MODE` | `1` | NIM 2.3 throughput defaults, including pipeline batch 64. Latency mode left a 20k embed near 326 inputs/s; throughput mode reached about 709 inputs/s on an H100 NVL and used ~39 GiB instead of ~6 GiB. |
-| `REMOTE_BUILD_POLL_INTERVAL` | `200ms` | OpenSearch waits `3 × poll.interval` before the first status check. The 5s default is about 15s of idle time per flush. |
-| `--flush-every` | `0` | One remote build after all bulks. Flushing every 10k docs repeated that wait. |
-| `--bulk-docs` / `--bulk-workers` | `1000` / `4` | Larger `orjson` NDJSON batches and parallel `_bulk` POSTs. 20k bulk fell from ~20s to ~5s. Four index threads commit up to four Lucene segments (`refresh_interval=-1` does not merge them). A 20k flush built three graphs (6,574 / 8,103 / 5,323 docs) one after another. |
-| `--flush-parallel` / `MAX_WORKERS` | `1` / `1` | One index, one CAGRA job. Four concurrent builds on the same GPU stretched each ~1s graph to ~26s. |
+| `pipeline.embed_index_ratio` | `10:1` | Memory parts on one GPU. Embedding gets 10/11, indexing 1/11. |
+| `pipeline.dynamic_embed` | `true` | Embedding's limit is the whole GPU, so idle index memory goes to embedding. The index cap stays at its 1 part. |
+| `pipeline.microbatch_size` | `10000` | Vectors embedded, then indexed, per step. |
+| `pipeline.index_every_docs` | `10000` | Remote CAGRA cadence. Same value as the microbatch means embed a batch, then index it, and repeat. `0` builds once after every bulk. |
+| `dataset.vectors` | `1000000` | Corpus length. 1024-d FP32 is 4 GB. |
+| `pipeline.target_recall_at_10` | `0.95` | Recorded in `metrics.json`. The run does not stop early on recall. |
 
-Published H100 FP16 passage throughput (batch 64, concurrency 1, 300 tokens) is 880 inputs/s. This client's MIRACL passages are ~125 tokens and the embed timer includes HTTP and the memmap write, so 709 inputs/s is still short of that table.
+Show the resolved MiB caps for the GPU this process can see:
+
+```bash
+python scripts/pipeline_config.py
+```
+
+The last line names the driver. `driver r615 enforces the caps` (or any major ≥ 615) means a hard memory cap is available. `gpu_fraction_enforced` is the same fact, and `run_e2e.py` copies it into `results/runai/metrics.json`.
+
+On the target RTX PRO 6000 (96 GiB) the `10:1` row is embedding request 89368 MiB / limit 98304 MiB, and indexing request = limit 8936 MiB. A live Docker start uses GPU 0's real size instead of 96 GiB. The checked-in Kubernetes manifest stays on the 96 GiB target; regenerate it for a different card (below).
+
+This repository configures the split. It does not install Run:ai, KAI Scheduler, or the GPU Fractioning Operator, and it does not upgrade the NVIDIA driver. The machine where this was written reports kernel module **610.43.02**, so a run there shares GPU 0 with the env vars set and no hard cap.
+
+## Run on another machine
+
+Use a host shell on the GPU machine. The agent sandbox cannot see `/dev/nvidia*` or the Docker socket.
+
+Hard caps need all of the following. Docker alone sets the variables; the runtime and driver apply them.
+
+- NVIDIA driver **r615 or newer** (CUDA 13.4). GPU Operator does not install r615 unless `driver.version` is set.
+- NVIDIA Container Toolkit **v1.20.1 or newer** (`apply-cuda-memory-limits`).
+- One GPU visible as GPU 0 (`NVIDIA_VISIBLE_DEVICES` in `.env`, default `0`).
+- Docker Compose v2, an NGC API key, and either real S3 credentials or LocalStack (`AWS_ENDPOINT_URL` / `S3_ENDPOINT`).
+
+```bash
+git clone https://github.com/ManasSingh12345/embedding-indexing-poc
+cd embedding-indexing-poc
+cp .env.example .env          # NGC_API_KEY, S3_BUCKET, AWS keys or a LocalStack endpoint
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+python3 scripts/pipeline_config.py
+./scripts/bootstrap.sh        # venv, MIRACL 1M, OpenSearch, builder, NIM
+./scripts/run_e2e.sh --limit 20000
+./scripts/run_e2e.sh          # 1,000,000 vectors, table defaults
+```
+
+`bootstrap.sh` creates `.venv`, installs `requirements.txt`, logs in to `nvcr.io`, downloads MIRACL, and calls `start_gpu_share.sh`. Run `./scripts/start_gpu_share.sh` again after any edit to `config/pipeline.yaml`. Each `run_e2e.sh` deletes and recreates the OpenSearch index `miracl-en-1m-cagra`.
+
+`vm.max_map_count` must be at least 262144 (`bootstrap.sh` sets it when `sysctl` is allowed). NIM's first start can take about 15 minutes. cuVS and CuPy are installed by `run_e2e.sh` from `pypi.nvidia.com` (`cuvs-cu13==26.8.1`, `cupy-cuda13x`).
+
+Embeddings are written as they finish to `results/runai/embeddings_fp32.npy` (1,000,000 × 1024 FP32). Metrics go to `results/runai/metrics.json`.
+
+| Metric | Field |
+|---|---|
+| Embed + index time | `embed_index_wall_s` (`embed_s`, `bulk_s`, `flush_s` underneath) |
+| Search p95 | `p95_latency_ms` |
+| Average QPS | `avg_qps` |
+| Recall@10 | `recall_at_10` |
+| Caps actually enforced | `gpu_fraction_enforced` |
+
+A proxy breaks localhost calls to NIM and OpenSearch. Leave `HTTP_PROXY` and `HTTPS_PROXY` unset in the shell that runs the scripts.
+
+## Run:ai on Kubernetes
+
+`deploy/k8s/embed-and-index.yaml` is the same 10:1 split as two pods on one GPU: NIM at `gpu-fraction: "0.9091"` (request 89368Mi, limit 98304Mi) and the builder at `"0.0909"` (8936Mi). KAI Scheduler places them. fractiond injects `NVIDIA_GPU_MEMORY_REQUEST` and `NVIDIA_GPU_MEMORY_LIMIT` before the container starts. Neither pod requests `nvidia.com/gpu`.
+
+The manifest does not include OpenSearch. OpenSearch stays on CPU. Point `knn.remote_index_build.service.endpoint` at `http://remote-index-builder.embed-index.svc:1025`. `run_e2e.sh` still dials `127.0.0.1:8000`, `:9200`, and `:1025`, so those ports have to reach the pods from the client machine.
+
+Cluster prerequisites, from the [GPU Fractioning Operator](https://github.com/kai-scheduler/gpu-fractioning) and [KAI GPU sharing](https://github.com/NVIDIA/KAI-Scheduler/blob/main/docs/gpu-sharing/README.md) docs:
+
+- Kubernetes 1.28+
+- containerd 2 with NRI, or CRI-O with NRI
+- GPU Operator **v26.7.1** or newer, with the driver pinned to r615 (the chart default is older):
+
+```bash
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
+helm install gpu-operator nvidia/gpu-operator \
+  --version v26.7.1 \
+  --namespace gpu-operator --create-namespace \
+  --set driver.version=615.<patch>
+```
+
+Toolkit v1.20.1+ and device plugin v0.20.1+ ship with that operator version. Leave `cdi.nriPluginEnabled` false unless `gpu-fractioning` is added to `NRI_MANAGEMENT_CDI_DEVICE_NAMESPACES`.
+
+- KAI Scheduler in NvFractions mode, which installs GPU fractioning with it:
+
+```bash
+helm upgrade -i kai-scheduler \
+  oci://ghcr.io/kai-scheduler/kai-scheduler/kai-scheduler \
+  -n kai-scheduler --create-namespace \
+  --set global.nvFractions.set=true
+```
+
+Wait until `GpuFractioningConfig` `default` is Ready and the GPU node condition `gpu-fractioning.nvidia.com/Ready` is True. Chart flags move; if this install command is rejected, use the KAI GPU sharing doc linked above.
+
+Then apply this repo's manifest. Create the secrets in `embed-index` before the pods start, and restart so they pick the secrets up:
+
+```bash
+kubectl apply -f deploy/k8s/embed-and-index.yaml
+kubectl create secret generic ngc-api --from-literal=NGC_API_KEY="$NGC_API_KEY" -n embed-index
+kubectl create secret generic s3-creds \
+  --from-literal=AWS_REGION="$AWS_REGION" \
+  --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+  --from-literal=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+  --from-literal=S3_BUCKET="$S3_BUCKET" \
+  -n embed-index
+kubectl rollout restart deployment -n embed-index
+```
+
+Regenerate after a table edit. The first file is the RTX PRO 6000 target and is what this repo commits. `--detect` sizes the caps to GPU 0 on the machine running the command; that file is gitignored.
+
+```bash
+python scripts/pipeline_config.py manifest --write deploy/k8s/embed-and-index.yaml
+python scripts/pipeline_config.py manifest --detect --write deploy/k8s/embed-and-index.local.yaml
+```
 
 ## Recall
 
-Ground truth is **cuVS brute-force cosine top-10** over the same L2-normalized vectors that were indexed, not MIRACL qrels. The 5,000 queries are document rows drawn with seed 42. OpenSearch search is inner product, `ef_search=256`, `k=10`.
+Ground truth is cuVS brute-force cosine top-10 on the same L2-normalized vectors, not MIRACL qrels. Queries are document rows drawn with seed 42. OpenSearch search is inner product, `ef_search=256`, `k=10`.
 
-Recall@10 matches cuVS [`calc_recall`](https://github.com/NVIDIA/cuvs/blob/main/notebooks/utils.py): for each query, `|set(pred[:k]) ∩ set(gt[:k])|`, divided by `n_queries * k`.
+Recall@10 matches cuVS `calc_recall`: for each query, `|set(pred[:k]) ∩ set(gt[:k])|`, divided by `n_queries * k`.
 
-## Local S3
+## Other knobs
 
-If `AWS_ENDPOINT_URL` or `S3_ENDPOINT` is set, `start_stack.sh` starts LocalStack and creates the bucket from the host (compose DNS names are rewritten to `127.0.0.1`). Leave those unset to use real AWS.
+These stay out of the ratio table because changing them does not change the GPU split. Override with flags or `.env`.
 
-## Nsight Systems
+| Knob | Default | Why |
+|---|---|---|
+| `NIM_PERFORMANCE_MODE` | `1` | Throughput batch 64. Latency mode was about half the embed rate and used much less VRAM. |
+| `REMOTE_BUILD_POLL_INTERVAL` | `200ms` | OpenSearch waits `3 × poll.interval` before the first status check. The 5s default is about 15s of idle time per flush. |
+| `BULK_DOCS` / `BULK_WORKERS` | `1000` / `4` | Parallel `_bulk` posts. Four index threads can commit several Lucene segments on one flush, and each segment gets its own CAGRA build. |
+| `FLUSH_PARALLEL` / `MAX_WORKERS` | `1` / `1` | One index, one CAGRA job. Several builds at once on one GPU were slower. |
 
-Do **not** wrap NIM or the builder with `nsys` as container PID 1. Profile the Python client. GPU performance counters need `NVreg_RestrictProfilingToAdminUsers=0` (otherwise `ERR_NVGPUCTRPERM` on this host). The script uses `vendor/nsight-systems` when present, otherwise `nsys` on `PATH` (`/usr/local/bin/nsys` here).
+If `AWS_ENDPOINT_URL` or `S3_ENDPOINT` is set, `start_stack.sh` starts LocalStack and creates the bucket.
 
-```bash
-# After NIM is healthy. Skips GPU counters if denied.
-./scripts/nsys_trace_all.sh
-```
+## Not in git
 
-Client NVTX ranges: `load_docs`, `opensearch_recreate`, `embed_batch`, `index_bulk`, `index_flush`, `cuvs_bruteforce_topk10`, `opensearch_search`. Report: `results/nsys_all/e2e.nsys-rep`. That file has **client NVTX and host cuVS kernels**. NIM and the builder are other containers, so their CUDA is not in it. System-wide CUDA injection does not cross into Docker here.
-
-A builder capture has to start nsys inside the container (`docker run --init`) and stop it with `docker exec -u appuser nsys stop --session=...` (uid 1001; a host `kill` is EPERM). Open that `.nsys-rep` next to the client report in the Nsight GUI. There is no CLI merge. NIM export crashes in `TimeConversion.cpp` during GPU tick conversion, so there is no NIM kernel report.
-
-On a 20k run the builder timeline is three bursts about 3s apart: one CAGRA build per Lucene segment, serial because `MAX_WORKERS=1`. Each burst is mostly k-means. The only NVTX ranges are CUB (`cub::DeviceHistogram::MultiHistogramEven`, `cub::DeviceFor::Bulk`). The graph itself is a short unannotated tail: two `compute_similarity` GEMMs, `kern_prune`, `kern_make_rev_graph`. About 166k `cudaFree`/`cudaMalloc` pairs are temporary-buffer churn (~7 per k-means step, median ~3µs), not HBM traffic. Kernel GPU time was 1.06s across 268k kernels (average 4µs); memcpy was about 4 GB/s. That loop is launch-and-allocation bound. The six long similarity GEMMs (0.24s) are the only kernels that might be compute- or bandwidth-bound, and this capture has no DRAM counters.
+`.env`, `data/`, `vendor/`, `results/`, `.venv/`, and `.cache/` stay local.
 
 ## Agent notes
 
-Project skill: [`.cursor/skills/m1-e2e-baseline/SKILL.md`](.cursor/skills/m1-e2e-baseline/SKILL.md). OpenSearch GPU builder details: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md).
+Project skill: [`.cursor/skills/m1-e2e-baseline/SKILL.md`](.cursor/skills/m1-e2e-baseline/SKILL.md). OpenSearch remote-build settings: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md).

@@ -6,6 +6,7 @@
 data/
 vendor/
 results/
+deploy/k8s/*.local.yaml
 __pycache__/
 *.pyc
 *.pyo

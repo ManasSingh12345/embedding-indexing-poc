@@ -1,0 +1,144 @@
+# Generated from config/pipeline.yaml by scripts/pipeline_config.py.
+# GPU Fractioning Operator: https://github.com/kai-scheduler/gpu-fractioning
+# Run:ai 10:1 on NVIDIA RTX PRO 6000 (98304 MiB): embed request 89368 MiB limit 98304 MiB, index request=limit 8936 MiB; embedding limit is the whole GPU while indexing is idle; caps are enforced by driver r615+ (CUDA 13.4)
+# OpenSearch stays on CPU. Point knn.remote_index_build.service.endpoint
+# at http://remote-index-builder.embed-index.svc:1025
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: embed-index
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nim-embed
+  namespace: embed-index
+  labels:
+    app: nim-embed
+    kai.scheduler/queue: default-queue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nim-embed
+  template:
+    metadata:
+      labels:
+        app: nim-embed
+        kai.scheduler/queue: default-queue
+      annotations:
+        gpu-fraction: "0.9091"
+        nvidia.com/container.nim.gpu-memory.request: 89368Mi
+        nvidia.com/container.nim.gpu-memory.limit: 98304Mi
+    spec:
+      schedulerName: kai-scheduler
+      containers:
+        - name: nim
+          image: nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.3.0
+          ports:
+            - containerPort: 8000
+          env:
+            - name: NGC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ngc-api
+                  key: NGC_API_KEY
+            - name: NIM_PERFORMANCE_MODE
+              value: "1"
+            - name: NVIDIA_GPU_MEMORY_REQUEST
+              value: "89368"
+            - name: NVIDIA_GPU_MEMORY_LIMIT
+              value: "98304"
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              memory: 64Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nim-embed
+  namespace: embed-index
+spec:
+  selector:
+    app: nim-embed
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remote-index-builder
+  namespace: embed-index
+  labels:
+    app: remote-index-builder
+    kai.scheduler/queue: default-queue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: remote-index-builder
+  template:
+    metadata:
+      labels:
+        app: remote-index-builder
+        kai.scheduler/queue: default-queue
+      annotations:
+        gpu-fraction: "0.0909"
+        nvidia.com/container.builder.gpu-memory.request: 8936Mi
+        nvidia.com/container.builder.gpu-memory.limit: 8936Mi
+    spec:
+      schedulerName: kai-scheduler
+      containers:
+        - name: builder
+          image: opensearchproject/remote-vector-index-builder:api-latest
+          ports:
+            - containerPort: 1025
+          env:
+            - name: MAX_WORKERS
+              value: "1"
+            - name: NVIDIA_GPU_MEMORY_REQUEST
+              value: "8936"
+            - name: NVIDIA_GPU_MEMORY_LIMIT
+              value: "8936"
+            - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: AWS_REGION
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: S3_BUCKET
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              memory: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: remote-index-builder
+  namespace: embed-index
+spec:
+  selector:
+    app: remote-index-builder
+  ports:
+    - port: 1025
+      targetPort: 1025

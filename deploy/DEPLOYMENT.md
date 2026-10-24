@@ -38,7 +38,7 @@ The custom OpenSearch image adds the `repository-s3` plugin (required for S3-bac
 ## Requirements
 
 - **Docker Compose v2**
-- **NVIDIA GPU** with CUDA support
+- **NVIDIA GPU** with CUDA support. Memory caps from `config/pipeline.yaml` are enforced on driver **r615+** (CUDA 13.4) with container toolkit **v1.20.1+**. Older drivers start the same containers without a cap. Full new-machine and Kubernetes steps are in the [README](../README.md).
 - **NVIDIA Container Toolkit** — [installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - **AWS S3 bucket** for staging vectors during the build
 
@@ -160,30 +160,14 @@ GPU builds are only available with the `faiss` engine. The `lucene` engine alway
 
 ## Verifying the GPU build
 
-The `remote-index-build/` directory contains an end-to-end demo script that ingests 200,000 random vectors, flushes the index to trigger remote builds, and confirms the GPU build completed by polling S3 for the resulting `.faiss` file.
-
-Run it inside a temporary container on the same Docker network:
+Run the pipeline client. It embeds a microbatch, bulks it, flushes so the remote builder writes a CAGRA graph, and repeats.
 
 ```bash
-docker compose run --rm \
-  -e OPENSEARCH_URL=http://opensearch:9200 \
-  -e BUILDER_URL=http://remote-index-builder:1025 \
-  -e S3_BUCKET=${S3_BUCKET} \
-  -e AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2} \
-  -e REMOTE_BUILD_SIZE_MIN=${REMOTE_BUILD_SIZE_MIN:-} \
-  -e REMOTE_BUILD_TIMEOUT=${REMOTE_BUILD_TIMEOUT:-1800} \
-  -e NUMBER_OF_SHARDS=${NUMBER_OF_SHARDS:-1} \
-  -e APPROXIMATE_THRESHOLD=${APPROXIMATE_THRESHOLD:-} \
-  -v $(pwd)/remote-index-build:/app/remote-index-build \
-  --no-deps bench \
-  python remote-index-build/run.py
+./scripts/start_gpu_share.sh
+./scripts/run_e2e.sh --limit 20000
 ```
 
-Static AWS credential environment variables are passed through by the `bench` service when they are exported on the host.
-
-Or run it directly if you have Python and the dependencies installed locally (`boto3`, `numpy`, `requests`), pointing `OPENSEARCH_URL` at `http://localhost:9200`.
-
-A successful run prints a `.faiss` file path in S3 and returns top-10 nearest-neighbor results.
+A successful run writes `results/runai/metrics.json` with `recall_at_10` and an OpenSearch count equal to the number of documents.
 
 ## Tearing down
 

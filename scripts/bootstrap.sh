@@ -18,6 +18,11 @@ fi
 
 : "${NGC_API_KEY:?NGC_API_KEY is required to pull NIM and (optional) the NGC builder image}"
 
+if [[ ! -x "${ROOT}/.venv/bin/python" ]]; then
+  python3 -m venv "${ROOT}/.venv"
+fi
+"${ROOT}/.venv/bin/pip" install -r "${ROOT}/requirements.txt"
+
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-2}}"
 export AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION}}"
 export IMG_NAME="${IMG_NAME:-nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.3.0}"
@@ -35,7 +40,7 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 if ! nvidia-smi >/dev/null 2>&1; then
-  echo "nvidia-smi failed. The RTX Pro 6000 must be visible before starting NIM/builder." >&2
+  echo "nvidia-smi failed. An NVIDIA GPU must be visible before starting NIM and the builder." >&2
   exit 1
 fi
 

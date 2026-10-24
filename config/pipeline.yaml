@@ -1,0 +1,59 @@
+# Configuration table for the single-GPU embed + CAGRA pipeline.
+# Edit the values, then apply them with ./scripts/start_gpu_share.sh
+# before the next ./scripts/run_e2e.sh. The YAML is the source of truth.
+
+dataset:
+  name: MIRACL
+  chunks: 1000000
+  vectors: 1000000
+  dim: 1024
+  dtype: FP32
+  size_gb: 4
+
+index:
+  type: CAGRA_HNSW
+  engine: faiss
+  space: innerproduct
+  m: 16
+  ef_construction: 256
+  ef_search: 256
+  size_gb: 6
+
+pipeline:
+  embedding_model: nvidia/llama-nemotron-embed-vl-1b-v2
+  nim_image: nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.3.0
+  vector_db: opensearch
+  # kai-scheduler/gpu-fractioning (Apache-2.0). One physical GPU, two memory fractions.
+  # Hard caps require driver r615+ (CUDA 13.4). Older drivers still start both containers.
+  gpu_sharing: runai-gpu-fractioning
+  # Memory parts on that GPU. 10:1 -> embedding 10/11, indexing 1/11.
+  embed_index_ratio: "10:1"
+  # Embedding's hard limit is the whole GPU, so memory the indexer is not
+  # using goes to embedding. The indexer stays capped at its 1 part.
+  dynamic_embed: true
+  microbatch_size: 10000
+  # Remote CAGRA build cadence. Equal to microbatch_size: embed one batch,
+  # index it, repeat. 0 builds once after every bulk.
+  index_every_docs: 10000
+  nim_batch: 64
+  nim_performance_mode: 1
+  bulk_docs: 1000
+  bulk_workers: 4
+  queries: 5000
+  k: 10
+  target_recall_at_10: 0.95
+  output_dir: results/runai
+
+hardware:
+  target_gpu: NVIDIA RTX PRO 6000
+  # 96 GiB. Live starts replace this with nvidia-smi on GPU 0.
+  target_gpu_memory_mib: 98304
+  gpus: 1
+  cpu_vcpus: 128
+
+runai:
+  namespace: embed-index
+  queue: default-queue
+  scheduler: kai-scheduler
+  # Operator default. Compute is time-sliced; memory caps are hard.
+  compute_mode: time-slicing

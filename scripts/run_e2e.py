@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Sequential 1M embed → OpenSearch CAGRA_HNSW index, cuVS brute-force Recall@10."""
+"""MIRACL embed → OpenSearch CAGRA_HNSW, one microbatch at a time.
+
+Defaults come from config/pipeline.yaml. GPU memory split is applied by
+scripts/start_gpu_share.sh (Run:ai GPU fractioning), not by this process.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +26,8 @@ import numpy as np
 import orjson
 import requests
 from tqdm import tqdm
+
+import pipeline_config
 
 try:
     import nvtx
@@ -508,31 +514,31 @@ def s3_faiss_count(bucket: str, prefix: str, region: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=1_000_000)
-    parser.add_argument("--microbatch", type=int, default=10_000)
-    parser.add_argument("--nim-batch", type=int, default=64)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--microbatch", type=int, default=None)
+    parser.add_argument("--nim-batch", type=int, default=None)
     parser.add_argument(
         "--bulk-docs",
         type=int,
-        default=int(os.environ.get("BULK_DOCS", "1000")),
-        help="Docs per OpenSearch _bulk request (default 1000).",
+        default=None,
+        help="Docs per OpenSearch _bulk request (default: config/pipeline.yaml).",
     )
     parser.add_argument(
         "--bulk-workers",
         type=int,
-        default=int(os.environ.get("BULK_WORKERS", "4")),
-        help="Parallel _bulk HTTP workers (default 4). 1 = serial.",
+        default=None,
+        help="Parallel _bulk HTTP workers (default: config/pipeline.yaml).",
     )
-    parser.add_argument("--queries", type=int, default=5_000)
-    parser.add_argument("--k", type=int, default=10)
-    parser.add_argument("--dim", type=int, default=1024)
-    parser.add_argument("--ef-search", type=int, default=256)
+    parser.add_argument("--queries", type=int, default=None)
+    parser.add_argument("--k", type=int, default=None)
+    parser.add_argument("--dim", type=int, default=None)
+    parser.add_argument("--ef-search", type=int, default=None)
     parser.add_argument("--gpu-usd-per-hour", type=float, default=3.0)
     parser.add_argument(
         "--flush-every",
         type=int,
-        default=0,
-        help="Flush+remote CAGRA every N docs. 0 = once after all bulks (default).",
+        default=None,
+        help="Flush+remote CAGRA every N docs. 0 = once after all bulks. Default: config/pipeline.yaml.",
     )
     parser.add_argument(
         "--flush-parallel",
@@ -543,9 +549,12 @@ def main() -> int:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=ROOT / "results" / "m1_sequential",
+        default=None,
     )
     args = parser.parse_args()
+    cfg = pipeline_config.apply_run_args(args)
+    share = pipeline_config.resolve(cfg)
+    print(pipeline_config.share_comment(share), flush=True)
 
     docs_path = ROOT / "data" / "miracl-en-1m" / "docs.jsonl"
     out_dir = args.out_dir
@@ -676,7 +685,14 @@ def main() -> int:
     results = {
         "ts_utc": datetime.now(timezone.utc).isoformat(),
         "hardware": gpu_product_name(),
-        "gpu_sharing": "sequential embed-then-index, both containers on GPU 0, no Run:ai",
+        "gpu_sharing": pipeline_config.share_comment(share),
+        "embed_index_parts": share.ratio,
+        "dynamic_embed": share.dynamic_embed,
+        "embed_gpu_request_mib": share.embed_request_mib,
+        "embed_gpu_limit_mib": share.embed_limit_mib,
+        "index_gpu_request_mib": share.index_request_mib,
+        "index_gpu_limit_mib": share.index_limit_mib,
+        "gpu_fraction_enforced": share.enforced,
         "model": model,
         "index": index_name,
         "dim": args.dim,
@@ -707,7 +723,7 @@ def main() -> int:
         "s3_faiss_after": faiss_after,
         "cuvs_gt_s": gt_s,
         "recall_at_10": recall,
-        "target_recall_at_10": 0.95,
+        "target_recall_at_10": float(cfg["pipeline"]["target_recall_at_10"]),
         "avg_qps": qps,
         "p50_latency_ms": p50,
         "p95_latency_ms": p95,

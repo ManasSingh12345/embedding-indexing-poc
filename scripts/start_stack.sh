@@ -16,6 +16,11 @@ export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-2}}"
 export AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION}}"
 export REMOTE_INDEX_BUILDER_IMAGE="${REMOTE_INDEX_BUILDER_IMAGE:-opensearchproject/remote-vector-index-builder:api-latest}"
 export MAX_WORKERS="${MAX_WORKERS:-1}"
+PY="${ROOT}/.venv/bin/python"
+if [[ ! -x "${PY}" ]]; then
+  PY=python3
+fi
+eval "$("${PY}" "${ROOT}/scripts/pipeline_config.py" exports)"
 export COMPOSE_PROFILES="${COMPOSE_PROFILES:-gpu}"
 if [[ -n "${S3_ENDPOINT:-}" || -n "${AWS_ENDPOINT_URL:-}" ]]; then
   case ",${COMPOSE_PROFILES}," in
