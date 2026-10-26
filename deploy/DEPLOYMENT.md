@@ -54,7 +54,7 @@ Set the required bucket name:
 
 ```bash
 export S3_BUCKET=opensearch-cuvs-bench
-export REMOTE_INDEX_BUILDER_IMAGE=nvcr.io/r2kuatviomfd/internal-sandbox/opensearchproject-remote-vector-index-builder:api-latest
+export REMOTE_INDEX_BUILDER_IMAGE=opensearchstaging/remote-vector-index-builder:api-snapshot
 export MAX_WORKERS=1  # remote builder workers (default: 1)
 ```
 

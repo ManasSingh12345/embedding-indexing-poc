@@ -2,8 +2,8 @@
 .env
 .env.*
 !.env.example
-.cache/
-data/
+/.cache
+/data
 vendor/
 results/
 deploy/k8s/*.local.yaml

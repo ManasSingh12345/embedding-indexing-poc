@@ -309,7 +309,8 @@ spec:
       schedulerName: {scheduler}
       containers:
         - name: builder
-          image: opensearchproject/remote-vector-index-builder:api-latest
+          image: opensearchstaging/remote-vector-index-builder:api-snapshot
+          imagePullPolicy: Always
           ports:
             - containerPort: 1025
           env:
@@ -320,6 +321,11 @@ spec:
             - name: NVIDIA_GPU_MEMORY_LIMIT
               value: "{share.index_limit_mib}"
             - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: AWS_REGION
+            - name: AWS_DEFAULT_REGION
               valueFrom:
                 secretKeyRef:
                   name: s3-creds

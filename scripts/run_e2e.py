@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""MIRACL embed → OpenSearch CAGRA_HNSW, one microbatch at a time.
+"""MIRACL embed overlapped with OpenSearch remote CAGRA builds.
 
-Defaults come from config/pipeline.yaml. GPU memory split is applied by
-scripts/start_gpu_share.sh (Run:ai GPU fractioning), not by this process.
+Each microbatch is embedded, bulk-written, then flushed. The flush for batch
+N runs while batch N+1 is embedding. Bulk of the next batch and the next
+flush wait, so only one remote build is in flight. Defaults come from
+config/pipeline.yaml. GPU memory split is applied by scripts/start_gpu_share.sh
+(Run:ai GPU fractioning), not by this process.
 """
 
 from __future__ import annotations
@@ -453,6 +456,66 @@ def wait_for_remote_build(os_knn: OpenSearchKnn, before: dict[str, Any], timeout
     # Do not fail the run solely on opaque stats; flush already completed.
 
 
+def overlap_event(origin: float, message: str) -> None:
+    # Leading newline so a tqdm carriage return cannot swallow the timestamp.
+    print(f"\noverlap {message} mono={time.perf_counter() - origin:.3f}", flush=True)
+
+
+class _InflightFlush:
+    """Remote CAGRA flush running while the next microbatch embeds.
+
+    ``start`` returns once ``_flush`` is in flight. ``wait`` joins that call,
+    including the post-flush stats settle. Bulk and the next flush stay on the
+    caller side of ``wait`` so OpenSearch never has two remote builds at once.
+    """
+
+    def __init__(self, os_knn: OpenSearchKnn, label: str, origin: float) -> None:
+        self.os_knn = os_knn
+        self.label = label
+        self.origin = origin
+        self.elapsed = 0.0
+        self.error: Exception | None = None
+        self._entered = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"cagra-flush-{label}", daemon=False
+        )
+
+    def _run(self) -> None:
+        started = False
+        try:
+            stats_before = self.os_knn.knn_stats()
+            overlap_event(self.origin, f"flush {self.label} started")
+            started = True
+            self._entered.set()
+            tf0 = time.perf_counter()
+            try:
+                with nvtx.annotate("index_flush", color=0x32CD32):
+                    self.os_knn.flush_and_refresh()
+                    wait_for_remote_build(self.os_knn, stats_before, timeout_s=180)
+            finally:
+                self.elapsed = time.perf_counter() - tf0
+        except Exception as exc:  # noqa: BLE001
+            self.error = exc
+        finally:
+            self._entered.set()
+            if started:
+                overlap_event(self.origin, f"flush {self.label} finished")
+
+    def start(self) -> None:
+        self._thread.start()
+        if not self._entered.wait(timeout=180):
+            raise TimeoutError(f"flush {self.label} did not start")
+        if self.error is not None:
+            self._thread.join(timeout=30)
+            raise self.error
+
+    def wait(self) -> None:
+        if self._thread.ident is not None:
+            self._thread.join()
+        if self.error is not None:
+            raise self.error
+
+
 def load_docs(path: Path, limit: int) -> tuple[list[str], list[str]]:
     texts: list[str] = []
     docids: list[str] = []
@@ -592,19 +655,20 @@ def main() -> int:
     bulk_s = 0.0
     flush_s = 0.0
     n_flushes = 0
-    t0 = time.perf_counter()
     n_batches = (n + args.microbatch - 1) // args.microbatch
     faiss_before = s3_faiss_count(bucket, prefix, region)
+    # Wall is the embed/index schedule only. S3 listing and GPU-sampler
+    # shutdown sit outside it so overlap shows up as wall < embed_s + index_s.
+    t0 = time.perf_counter()
+    inflight: _InflightFlush | None = None
 
-    def do_flush() -> None:
-        nonlocal flush_s, n_flushes
-        stats_before = os_knn.knn_stats()
-        tf0 = time.perf_counter()
-        with nvtx.annotate("index_flush", color=0x32CD32):
-            os_knn.flush_and_refresh()
-            wait_for_remote_build(os_knn, stats_before, timeout_s=180)
-        flush_s += time.perf_counter() - tf0
+    def finish_flush(job: _InflightFlush) -> None:
+        nonlocal flush_s, n_flushes, inflight
+        job.wait()
+        flush_s += job.elapsed
         n_flushes += 1
+        if inflight is job:
+            inflight = None
 
     try:
         indexed_since_flush = 0
@@ -613,13 +677,22 @@ def main() -> int:
             batch_texts = texts[sl]
             batch_ids = docids[sl]
             rows = np.arange(sl.start, sl.stop, dtype=np.int32)
+            batch_no = b + 1
 
+            # Embed overlaps the previous batch's remote build, if one is in flight.
+            overlap_event(t0, f"embed {batch_no} started")
             te0 = time.perf_counter()
             with nvtx.annotate("embed_batch", color=0x1E90FF):
                 vecs = nim.embed(batch_texts, input_type="passage")
                 embeddings[sl] = vecs
                 embeddings.flush()
             embed_s += time.perf_counter() - te0
+            overlap_event(t0, f"embed {batch_no} finished")
+
+            # Bulk takes the shard. Do it only after the in-flight build returns
+            # so flush time is not mixed into bulk_s and a second build cannot start.
+            if inflight is not None:
+                finish_flush(inflight)
 
             tb0 = time.perf_counter()
             with nvtx.annotate("index_bulk", color=0x228B22):
@@ -628,15 +701,25 @@ def main() -> int:
                 )
             bulk_s += time.perf_counter() - tb0
             indexed_since_flush += len(batch_texts)
-            last = b + 1 == n_batches
+            last = batch_no == n_batches
             if args.flush_every > 0 and indexed_since_flush >= args.flush_every and not last:
-                do_flush()
+                if inflight is not None:
+                    finish_flush(inflight)
+                inflight = _InflightFlush(os_knn, str(batch_no), t0)
+                inflight.start()
                 indexed_since_flush = 0
-        do_flush()
+        if inflight is not None:
+            finish_flush(inflight)
+        final_label = str(n_batches) if n_batches else "final"
+        final_job = _InflightFlush(os_knn, final_label, t0)
+        inflight = final_job
+        final_job.start()
+        finish_flush(final_job)
+        wall_s = time.perf_counter() - t0
     finally:
+        if inflight is not None and inflight._thread.ident is not None:
+            inflight._thread.join()
         gpu_summary = gpu.stop()
-
-    wall_s = time.perf_counter() - t0
     index_s = bulk_s + flush_s
     count = os_knn.count()
     faiss_after = s3_faiss_count(bucket, prefix, region)

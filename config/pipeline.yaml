@@ -32,8 +32,8 @@ pipeline:
   # using goes to embedding. The indexer stays capped at its 1 part.
   dynamic_embed: true
   microbatch_size: 10000
-  # Remote CAGRA build cadence. Equal to microbatch_size: embed one batch,
-  # index it, repeat. 0 builds once after every bulk.
+  # Remote CAGRA cadence. run_e2e.py embeds the next microbatch while the
+  # previous flush builds. 0 builds once after every bulk.
   index_every_docs: 10000
   nim_batch: 64
   nim_performance_mode: 1

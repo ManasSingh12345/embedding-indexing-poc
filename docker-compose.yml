@@ -19,6 +19,7 @@ x-aws-env: &aws-env
   AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
   AWS_S3_ENDPOINT: ${AWS_ENDPOINT_URL:-}
   S3_ENDPOINT: ${S3_ENDPOINT:-}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-${AWS_ENDPOINT_URL:-${S3_ENDPOINT:-}}}
   AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
   AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
   AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
@@ -58,7 +59,7 @@ services:
   # GPU CAGRA build. OpenSearch itself stays on CPU; this service is the GPU path.
   remote-index-builder:
     profiles: [gpu]
-    image: ${REMOTE_INDEX_BUILDER_IMAGE:-opensearchproject/remote-vector-index-builder:api-latest}
+    image: ${REMOTE_INDEX_BUILDER_IMAGE:-opensearchstaging/remote-vector-index-builder:api-snapshot}
     container_name: remote-index-builder
     restart: unless-stopped
     gpus:
