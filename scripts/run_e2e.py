@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""MIRACL embed overlapped with OpenSearch remote CAGRA builds.
+"""MIRACL embed overlapped with OpenSearch remote CAGRA or CPU HNSW builds.
 
 Each microbatch is embedded, bulk-written, then flushed. The flush for batch
 N runs while batch N+1 is embedding. Bulk of the next batch and the next
-flush wait, so only one remote build is in flight. Defaults come from
-config/pipeline.yaml. GPU memory split is applied by scripts/start_gpu_share.sh
-(Run:ai GPU fractioning), not by this process.
+flush wait, so only one remote build is in flight. --cpu-index disables
+remote CAGRA for this index and builds FAISS HNSW on the OpenSearch JVM.
+Defaults come from config/pipeline.yaml. GPU memory split is applied by
+scripts/start_gpu_share.sh (Run:ai GPU fractioning), not by this process.
 """
 
 from __future__ import annotations
@@ -169,10 +170,11 @@ class NimClient:
 
 
 class OpenSearchKnn:
-    def __init__(self, url: str, index: str, dim: int) -> None:
+    def __init__(self, url: str, index: str, dim: int, remote_index_build: bool = True) -> None:
         self.url = url.rstrip("/")
         self.index = index
         self.dim = dim
+        self.remote_index_build = remote_index_build
         self.n_parts = 1
         self.part_names = [index]
         self._tls = threading.local()
@@ -226,7 +228,7 @@ class OpenSearchKnn:
         body = {
             "settings": {
                 "index.knn": True,
-                "index.knn.remote_index_build.enabled": True,
+                "index.knn.remote_index_build.enabled": self.remote_index_build,
                 "index.knn.remote_index_build.size.min": "1kb",
                 "index.knn.advanced.approximate_threshold": 0,
                 "index.knn.algo_param.ef_search": 256,
@@ -614,6 +616,11 @@ def main() -> int:
         type=Path,
         default=None,
     )
+    parser.add_argument(
+        "--cpu-index",
+        action="store_true",
+        help="Build FAISS HNSW on the OpenSearch JVM (CPU). Disables remote CAGRA for this index.",
+    )
     args = parser.parse_args()
     cfg = pipeline_config.apply_run_args(args)
     share = pipeline_config.resolve(cfg)
@@ -643,7 +650,11 @@ def main() -> int:
     )
 
     nim = NimClient(nim_url, model, args.dim, args.nim_batch)
-    os_knn = OpenSearchKnn(os_url, index_name, args.dim)
+    os_knn = OpenSearchKnn(os_url, index_name, args.dim, remote_index_build=not args.cpu_index)
+    if args.cpu_index:
+        print("Index build: CPU FAISS HNSW (remote CAGRA disabled)", flush=True)
+    else:
+        print("Index build: remote GPU CAGRA -> served FAISS HNSW", flush=True)
     print("Creating OpenSearch index", flush=True)
     with nvtx.annotate("opensearch_recreate", color=0xFFD700):
         os_knn.recreate(args.flush_parallel)
@@ -797,6 +808,7 @@ def main() -> int:
         "bulk_docs": args.bulk_docs,
         "bulk_workers": args.bulk_workers,
         "flush_parallel": args.flush_parallel,
+        "index_build": "cpu_hnsw" if args.cpu_index else "gpu_cagra",
         "embed_index_ratio": (embed_s / index_s) if index_s else None,
         "vectors_per_s": n / wall_s if wall_s else None,
         "embed_vectors_per_s": n / embed_s if embed_s else None,

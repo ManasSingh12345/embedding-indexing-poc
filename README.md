@@ -1,22 +1,22 @@
 # Embed and index on one GPU
 
-Measure embed + index time, search p95, QPS, and Recall@10 for 1,000,000 MIRACL vectors (1024-d FP32) on one GPU. NIM and the remote index builder share that GPU through Run:ai's [GPU Fractioning Operator](https://github.com/kai-scheduler/gpu-fractioning). OpenSearch stays on CPU.
+Measure embed + index wall time, search p95, QPS, and Recall@10 for 1,000,000 MIRACL vectors (1024-d FP32) on one GPU. NIM and the remote index builder share that GPU through Run:ai's [GPU Fractioning Operator](https://github.com/kai-scheduler/gpu-fractioning). OpenSearch stays on CPU.
 
-`scripts/run_e2e.py` embeds microbatch N+1 while the remote builder turns batch N into an HNSW graph. Only one CAGRA build is in flight. The served index is FAISS HNSW (`HNSW16,Flat`, inner product). CAGRA is the GPU build, not a separate search index.
+`scripts/run_e2e.py` embeds microbatch N+1 while flush N runs. Only one remote build is in flight. The served index is FAISS HNSW (`HNSW16,Flat`, inner product). CAGRA is the GPU build, not a separate search index. `--cpu-index` skips the builder and builds that HNSW on the OpenSearch JVM.
 
 ```
 MIRACL texts → NIM → OpenSearch bulk
-                next embed overlaps remote CAGRA
+                next embed overlaps flush N (CAGRA or CPU HNSW)
                 → cuVS GT top-10 → OpenSearch kNN → metrics.json
 ```
 
-How-to notebook: [`notebooks/embed_index_runai.ipynb`](notebooks/embed_index_runai.ipynb). Source of truth: [`config/pipeline.yaml`](config/pipeline.yaml).
+How-to: [`notebooks/embed_index_runai.ipynb`](notebooks/embed_index_runai.ipynb). Source of truth: [`config/pipeline.yaml`](config/pipeline.yaml).
 
 ## Configuration
 
 | Field | Default | Effect |
 |---|---|---|
-| `pipeline.embed_index_ratio` | `10:1` | Memory split. Embedding 10/11, indexing 1/11. Cores are not split. |
+| `pipeline.embed_index_ratio` | `10:1` | **Memory** split. Embedding 10/11, indexing 1/11. SMs are not split. |
 | `pipeline.dynamic_embed` | `true` | Embedding's limit is the whole GPU. The index cap stays at its 1 part. |
 | `pipeline.microbatch_size` | `10000` | Vectors per embed step. |
 | `pipeline.index_every_docs` | `10000` | Flush cadence. `0` builds once after every bulk. |
@@ -27,30 +27,38 @@ How-to notebook: [`notebooks/embed_index_runai.ipynb`](notebooks/embed_index_run
 python scripts/pipeline_config.py
 ```
 
-`driver r615 enforces the caps` means the memory cap is real. On a 96 GiB RTX PRO 6000 the 10:1 row is embed request 89368 MiB / limit 98304 MiB, index request = limit 8936 MiB. `--detect` uses GPU 0's real size. The committed manifest stays on the 96 GiB target.
+`driver r615 enforces the caps` means the memory cap is real. On a 96 GiB RTX PRO 6000 the 10:1 row is embed request 89368 MiB / limit 98304 MiB, index request = limit 8936 MiB. `--detect` uses GPU 0's real size. The committed manifest stays on the 96 GiB target. Live pods on the 8 vCPU box use lower CPU/memory and a slightly lower embed MiB cap so the builder can schedule; that lives in gitignored `embed-and-index.local.yaml`.
+
+Run:ai fractions do not partition SMs. Both processes may use every SM (MPS). Overlapping GPU CAGRA with a saturated embedder slows embed ~10% and stretches CAGRA ~8×. A hard SM split (MIG, 25% steps on this SKU) is worse for this pipeline: embed wants the whole GPU for ~44 min, then a short index. `--flush-every 0` is embed then one GPU index. `--cpu-index` is GPU embed plus CPU HNSW.
 
 ## Run
 
-Host shell on the GPU machine. Unset `HTTP_PROXY` and `HTTPS_PROXY`. Each `run_e2e.sh` deletes and recreates `miracl-en-1m-cagra`.
+Host shell on the GPU machine. Unset `HTTP_PROXY` and `HTTPS_PROXY`. Each `run_e2e.sh` deletes and recreates `miracl-en-1m-cagra`. Do not start a second e2e while one is running.
 
 ```bash
 cp .env.example .env
 python3 scripts/pipeline_config.py
 ./scripts/bootstrap.sh
-./scripts/run_e2e.sh --limit 20000
-./scripts/run_e2e.sh --microbatch 10000 --flush-every 10000
+./scripts/run_e2e.sh --limit 20000 --out-dir results/runai-smoke-20k
+./scripts/run_e2e.sh --limit 20000 --cpu-index --out-dir results/runai-smoke-20k-cpu-hnsw
+./scripts/run_e2e.sh --microbatch 10000 --flush-every 10000 --out-dir results/runai-1m-overlap
+./scripts/run_e2e.sh --microbatch 1000000 --flush-every 0 --out-dir results/runai-1m-fullbatch
+./scripts/run_e2e.sh --microbatch 10000 --flush-every 10000 --cpu-index --out-dir results/runai-1m-overlap-cpu-hnsw
 ```
 
-`--flush-every 0 --microbatch 1000000` is one embed, then one index. Metrics land in `results/runai/metrics.json` unless `--out-dir` is set. `embed_index_wall_s` is the overlapped schedule; `embed_s` is the sum of embed calls and does not shrink when a flush overlaps.
+`--flush-every 0 --microbatch 1000000` is one embed, then one index. `--cpu-index` sets `index.knn.remote_index_build.enabled` false for that index. Metrics land in `results/runai/metrics.json` unless `--out-dir` is set. `embed_index_wall_s` is the overlapped schedule; `embed_s` is the sum of embed calls. `index_build` is `gpu_cagra` or `cpu_hnsw`.
 
 | Metric | Field |
 |---|---|
 | Embed + index time | `embed_index_wall_s` (`embed_s`, `bulk_s`, `flush_s`) |
 | Search p95 / QPS | `p95_latency_ms`, `avg_qps` |
 | Recall@10 | `recall_at_10` |
+| Index path | `index_build` |
 | Caps enforced | `gpu_fraction_enforced` |
 
 Ground truth is cuVS brute-force cosine top-10 on the indexed vectors, not MIRACL qrels. Recall@10 is `|pred ∩ gt| / (n_queries * k)`.
+
+On this host (NIM warm, snapshot builder, 1M docs) the shortest walls were CPU-HNSW overlap (~46 min, recall 0.9998) then full embed + one GPU CAGRA (~48 min, 0.9996). 10k GPU-CAGRA overlap was ~54 min (0.99918): embed dropped from ~379 to ~336 vec/s while CAGRA shared SMs.
 
 ## Builder image
 
@@ -62,7 +70,7 @@ The builder reads `AWS_DEFAULT_REGION` and `S3_ENDPOINT_URL`. `AWS_REGION` and `
 
 ## Kubernetes
 
-`scripts/install-k8s-runai.sh` brings up a single-node cluster: containerd NRI, kubeadm, Flannel, GPU Operator v26.7.1 with the host driver left as-is, and KAI Scheduler NvFractions. It refuses to run if `nvidia-smi` is not **615.71.10**. It writes `deploy/k8s/embed-and-index.local.yaml` (gitignored) with hostPorts 8000 and 1025 and the LocalStack endpoint. OpenSearch and LocalStack stay in Docker.
+`scripts/install-k8s-runai.sh` brings up a single-node cluster: containerd NRI, kubeadm, Flannel, GPU Operator v26.7.1 with the host driver left as-is, and KAI Scheduler NvFractions. It refuses to run if `nvidia-smi` is not **615.71.10**. It writes `deploy/k8s/embed-and-index.local.yaml` (gitignored) with hostPorts 8000 and 1025 and the LocalStack endpoint. OpenSearch and LocalStack stay in Docker. Do not re-run kubeadm if the cluster is already up. Do not replace the driver.
 
 ```bash
 bash scripts/install-k8s-runai.sh
@@ -90,6 +98,7 @@ python scripts/pipeline_config.py manifest --detect --write deploy/k8s/embed-and
 | `REMOTE_BUILD_POLL_INTERVAL` | `200ms` | The 5s default idles about 15s per flush. |
 | `BULK_DOCS` / `BULK_WORKERS` | `1000` / `4` | Parallel bulk. Several Lucene segments per flush. |
 | `FLUSH_PARALLEL` / `MAX_WORKERS` | `1` / `1` | One remote build. Parallel builds on one GPU were slower. |
+| `--cpu-index` | off | CPU FAISS HNSW. Builder stays up but is not called. |
 
 ## Not in git
 
